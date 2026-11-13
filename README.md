@@ -89,12 +89,12 @@ s15 是集成实现，s16 在它上面扩展工作流；各独立示例并不都
 
 **[交付流程与证据目录 →](docs/delivery.md)** · [流程脚本](vendor/idea-to-launch-kit/kit.sh) · [技术手册](vendor/idea-to-launch-kit/docs/手册/)
 
-## 工作流
+## 工作流程
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/workflow-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="assets/workflow-light.svg">
-  <img alt="Leo Agent Kit 产品交付工作流：需求与方案、组件与实现、验收与交付；新需求回到工坊进入下一轮。" src="assets/workflow-light.svg" width="1200">
+  <img alt="Leo Agent Kit 产品交付工作流程：输入需求、推导方案、确认 PRD、交接独立工作区、分阶段实现、自检验收与上线维护。" src="assets/workflow-light.svg" width="1200">
 </picture>
 
 工坊与交付工作区通过文档连接。工坊负责产品推导与方案演进；交付工作区负责正式实现与验收。两处文件不会自动双向同步。
