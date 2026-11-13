@@ -2,7 +2,6 @@
 
 面向 AI 产品经理的本地开发工具箱：学习 Harness、推导产品架构，再把 PRD 和方案交给编码助手按阶段实现。
 
-[![MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square)
 
 ## 三个工作入口
@@ -65,7 +64,3 @@ python3 leo.py delivery my-agent status
 python3 -m unittest discover -s tests -v
 python3 leo.py doctor
 ```
-
-## 授权
-
-[MIT 许可证](LICENSE) · [版本与版权信息](COPYRIGHT.md)
