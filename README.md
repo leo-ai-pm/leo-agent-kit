@@ -13,6 +13,18 @@ Harness 组件库 · 产品架构工坊 · 分阶段开发与验收
 
 </div>
 
+## 源码入口
+
+三个模块的完整内容都在下面的目录中，点击即可查看代码、测试与资源。
+
+| 模块 | 直接浏览源码 | 文件数 | 主要内容 |
+|---|---|---:|---|
+| Harness 组件库 | [claude-code-harness-study/](vendor/claude-code-harness-study/) | 183 | s01–s17 实现、浏览界面、组件测试、机制图示 |
+| 产品架构工坊 | [agent-workshop/](vendor/agent-workshop/) | 417 | 推导引擎、网页前端、桌面工程、评估案例与测试 |
+| 项目交付 | [idea-to-launch-kit/](vendor/idea-to-launch-kit/) | 40 | 阶段管理、自检脚本、技术手册、部署参考与产品模板 |
+
+以上共 **640 个文件**，包含代码、测试、文档与资源。GitHub 文件列表只展示当前层级：根目录的一个 `vendor/` 文件夹，内部包含这三个完整模块；根目录的 `leo.py` 是统一入口。
+
 ## 这个项目解决什么问题
 
 一个 AI 产品从想法到上线，通常要先回答三件事：需要哪些 Agent 能力、这些能力如何组成产品、开发到什么程度才能验收。
@@ -79,17 +91,11 @@ s15 是集成实现，s16 在它上面扩展工作流；各独立示例并不都
 
 ## 工作流
 
-```mermaid
-flowchart LR
-    A[想法或 PRD] --> B[工坊：需求与架构方案]
-    H[Harness 组件库] -.参考实现.-> B
-    B --> C[确认 PRD 与方案]
-    C --> D[交接到独立工作区]
-    D --> E[编码助手按阶段实现]
-    E --> F[自检与人工验收]
-    F --> G[上线与维护]
-    F -->|新需求| B
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/workflow-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/workflow-light.svg">
+  <img alt="Leo Agent Kit 产品交付工作流：需求与方案、组件与实现、验收与交付；新需求回到工坊进入下一轮。" src="assets/workflow-light.svg" width="1200">
+</picture>
 
 工坊与交付工作区通过文档连接。工坊负责产品推导与方案演进；交付工作区负责正式实现与验收。两处文件不会自动双向同步。
 
