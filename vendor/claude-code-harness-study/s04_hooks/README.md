@@ -1,0 +1,297 @@
+# s04: Hooks — 挂在循环上，不写进循环里
+
+s01 → s02 → s03 → `s04` → [s05](../s05_todo_write/) → s06 → ... → s16 → s17
+
+> *"挂在循环上，不写进循环里"* — 钩子（hook）在工具执行前后留出插口，扩展挂在插口上。
+>
+> **Harness 层**: hook — 扩展点不侵入循环。
+
+---
+
+## 本章要学会的判断
+
+- **它解决什么**：在工具执行前后留插口，统一加日志、合规检查、计费，不用每个工具各写一遍。
+- **什么时候需要它**：要统一做审计留痕、敏感词过滤、计费这类「每次都要做」的事。
+- **你要拍板的规则**：哪些时机必须留痕；哪些检查有权否决执行。
+
+> 代码看不懂可以先跳过，到网页上看「回放」动画。详细的判断方法在本章末尾的「产品经理视角」。
+
+### 本章新词
+
+每章最多三个新词。看不懂的其他词，去[名词表](../guide/glossary.md)查。
+
+| 词 | 意思 | 比喻 |
+|---|---|---|
+| 钩子 | 循环在固定位置「喊一声」，挂在那个位置上的小程序就会跑。要加检查，挂上去就行，不用改循环 | 门口的打卡机，进门出门都要刷一下 |
+| 留痕（审计） | 把谁在什么时候做了什么记下来，出了问题能追查 | 公司的进出登记本 |
+| 否决 | 一个检查有权说「这步不许做」，后面的步骤就不再执行 | 财务不签字，报销走不下去 |
+
+---
+
+## 问题
+
+s03 的 Agent 有权限检查了。但每加一个新要求，比如「每次执行命令都记一笔日志」「改完文件自动备份」「出错了通知负责人」，都要去改循环本身的代码。
+
+改着改着，循环里塞满了检查、通知、备份，原本十来行的核心谁也认不出来了。
+
+你想扩展的是 Agent 的行为，但你改的却是循环本身。循环应该是一个稳定的核心，扩展应该挂在外面。
+
+---
+
+## 解决方案
+
+![Hooks Overview](images/hooks-overview.svg)
+
+s03 的循环和权限逻辑完全保留。唯一的变动：权限检查不再写在循环里，而是挂到一个固定位置上。循环只负责在固定位置「喊一声」，喊到谁，谁就跑；喊的位置一共四个。
+
+| 位置 | 什么时候喊 | 典型用途 |
+|------|---------|---------|
+| 用户输入之后（UserPromptSubmit） | 你的话刚发出，还没交给模型 | 检查输入、补上当前时间等背景 |
+| 执行工具之前（PreToolUse） | 模型要用工具，程序还没动手 | 权限检查、记日志 |
+| 执行工具之后（PostToolUse） | 工具刚跑完 | 自动备份、检查输出 |
+| 循环要结束时（Stop） | 模型说做完了，程序准备停下 | 收尾、决定要不要继续 |
+
+要加新检查，就往对应位置上再挂一个；循环本身一行都不用改。
+
+---
+
+## 工作原理
+
+先看 s03 那种写法的下场。检查一多，循环就会变成这样：
+
+```python
+def agent_loop(messages):
+    while True:
+        # ... LLM call ...
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            log_to_file(block)          # 加一行
+            check_permission(block)     # 加一行
+            notify_slack(block)         # 又加一行
+            output = execute(block)
+            auto_git_add(block)         # 再加一行
+            # ... 很快循环就认不出来了
+```
+
+**hook 注册表**：一个字典，事件名映射到回调列表。
+
+```python
+HOOKS = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:   # 返回值 ≠ None → hook 说"停"
+            return result
+    return None
+```
+
+`PreToolUse` 返回非 `None` 时，本次工具执行被阻止；`Stop` 返回非 `None` 时，循环继续。`UserPromptSubmit` 和 `PostToolUse` 的返回值不参与控制流。
+
+**UserPromptSubmit** 在用户输入提交后、进入 LLM 前触发。以下 hook 记录当前工作目录：
+
+```python
+def context_inject_hook(query: str) -> str | None:
+    """Inject current working directory info into every prompt."""
+    print(f"\033[90m[钩子] UserPromptSubmit：工作目录 {WORKDIR}\033[0m")
+    return None   # return None = no modification, let prompt through
+
+register_hook("UserPromptSubmit", context_inject_hook)
+```
+
+在主循环中，用户输入后立即触发：
+
+```python
+query = input("s04 >> ")
+trigger_hooks("UserPromptSubmit", query)   # ← 进入 LLM 之前
+history.append({"role": "user", "content": query})
+agent_loop(history)
+```
+
+**PreToolUse / PostToolUse**，工具执行前后的 hook。s03 的权限检查逻辑现在包装成 PreToolUse hook，再加一个日志 hook 和一个大输出提醒：
+
+```python
+# PreToolUse: 权限检查（s03 的逻辑，从循环移到 hook）
+def permission_hook(block):
+    if block.name == "bash":
+        for pattern in DENY_LIST:
+            if matches_rule(block.input.get("command", ""), pattern):
+                return "权限被拒绝：命中黑名单"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            choice = input("   允许执行吗？[y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "权限被拒绝：用户不允许"
+    return None
+
+# PreToolUse: 日志
+def log_hook(block):
+    print(f"[钩子] {block.name}(...)")
+
+# PostToolUse: 大文件提醒
+def large_output_hook(block, output):
+    if len(str(output)) > 100000:
+        print(f"[钩子] 输出很长，来自 {block.name}")
+
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+```
+
+**Stop** 在循环即将退出时触发。以下 hook 打印收尾统计：
+
+```python
+def summary_hook(messages: list) -> str | None:
+    """Print a summary when the loop is about to stop."""
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[钩子] Stop：这次会话共调用了 {tool_count} 次工具\033[0m")
+    return None   # return None = allow stop, return string = force continuation
+
+register_hook("Stop", summary_hook)
+```
+
+在 agent_loop 中，退出前触发：
+
+```python
+tool_calls = [
+    block for block in response.content if block.type == "tool_use"
+]
+if not tool_calls:
+    force = trigger_hooks("Stop", messages)   # ← 退出之前
+    if force:
+        # hook returned a message → inject it and continue
+        messages.append({"role": "user", "content": force})
+        continue
+    return
+```
+
+**循环里只改了一处**：s03 直接调用 `check_permission(block)`，s04 改为 `trigger_hooks("PreToolUse", block)`：
+
+```python
+for block in tool_calls:
+    # s03: if not check_permission(block): ...
+    # s04: hook 替代硬编码
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        results.append({"type": "tool_result", "tool_use_id": block.id,
+                        "content": str(blocked)})
+        continue
+
+    handler = TOOL_HANDLERS.get(block.name)
+    output = handler(**block.input) if handler else f"未知工具：{block.name}"
+
+    trigger_hooks("PostToolUse", block, output)
+
+    results.append({"type": "tool_result", "tool_use_id": block.id,
+                    "content": output})
+```
+
+四个 hook 覆盖了 agent cycle 的关键节点：输入→执行前→执行后→退出。循环只负责调用 trigger_hooks()，具体逻辑全在 hook 回调里。
+
+---
+
+## 相对 s03 的变更
+
+| 组件 | 之前 (s03) | 之后 (s04) |
+|------|-----------|-----------|
+| 扩展方式 | check_permission() 硬编码在循环里 | HOOKS 注册表 + trigger_hooks() |
+| 新函数 | — | register_hook, trigger_hooks |
+| hook 回调 | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
+| 循环 | 直接调用 check_permission() | 调用 trigger_hooks("PreToolUse", ...) |
+| 退出控制 | 无 | trigger_hooks("Stop", ...) 可阻止退出 |
+| 输入拦截 | 无 | trigger_hooks("UserPromptSubmit", ...) 可注入上下文 |
+
+---
+
+## 试一下
+
+```sh
+cd claude-code-harness-study
+python s04_hooks/code.py
+```
+
+试试这些话：
+
+1. `读一下 README.md`（直接通过，注意屏幕上多出来的「[钩子]」日志行）
+2. `新建一个 test.txt`（通过后看「执行工具之后」的钩子有没有响）
+3. `删除 test.txt 这个文件`（删文件触发「执行工具之前」的权限钩子，停下来问你）
+
+观察重点：每次工具执行前，是否出现了 `[钩子]` 日志？权限被拒时，是 hook 拦截的还是循环里硬编码的？
+
+---
+
+## 产品经理视角
+
+> 钩子是给公司规矩留的插口。审计、合规、计费这类「每一步都要管」的事，统一挂在钩子上处理。
+
+### 什么信号说明需要它
+
+- 法务、安全要求「每一步都要留痕」。
+- 同一项检查要加在很多工具上，比如敏感词过滤、数据脱敏。
+- 需要在特定时机自动做事：操作后自动备份，任务结束时发通知。
+- 不同客户要不同的规则，又不想为每一家改核心代码。
+
+### 代价
+
+- **不透明**：钩子多了，一次操作到底经过了哪些检查很难看清，出了问题不好排查。
+- **变慢**：每个钩子都会增加一点等待时间。
+- **误拦**：钩子本身写错了，会拦下正常操作。
+
+### 先试试更便宜的办法
+
+- 只有一两个工具需要这项检查，就直接写在那个工具里，不需要钩子。
+
+### 你要拍板的规则
+
+| 规则 | 示例 |
+|---|---|
+| 哪些时机必须留痕 | 每次工具调用的前后、每次对外发消息 |
+| 哪些检查可以否决执行 | 发现回答里有身份证号，直接拦截 |
+| 日志存多久、谁能看 | 保存 180 天，只有安全部门能查 |
+| 钩子自己出错怎么办 | 审计钩子出错时，是停下不执行，还是放行并告警，要提前定 |
+
+### 怎么衡量
+
+- **留痕覆盖率**：抽查，应该是 100%。
+- **误拦率**：被拦下的操作里，有多少其实是正常的。
+- **额外耗时**：钩子让每次操作慢了多少。
+
+### 真实产品里的样子
+
+- Claude Code 在工具调用前、工具调用后、用户提交问题时、回答结束时等多个时机都提供钩子。企业常用它记录审计日志、自动整理代码格式、拦截危险命令。
+- Cursor 在 2025 年也推出了钩子功能（测试版）。
+- 选型篇的对照表里，Dify 和 Coze 开源版都没有钩子。要统一做审计和合规检查，低代码平台会比较吃力。
+
+### 面试题
+
+**「法务要求 Agent 的每一步操作都能追溯，你怎么落地？」**
+
+答题要点：
+
+- 用钩子统一记录，而不是靠每个工具自己记。
+- 定清楚记什么：谁、什么时候、调用了什么、输入了什么、结果是什么。
+- 定清楚存多久、谁能看；敏感数据在日志里也要脱敏。
+- 定期抽查覆盖率。
+- 选型时就要确认方案支持钩子。
+
+> 16 个组件的判断卡放在一起比较，见 [选型篇](../guide/README.md)。
+
+---
+
+## 接下来
+
+Agent 现在能安全执行操作了。但它有没有停下来想过"我应该先做什么，再做什么"？给它一个复杂任务，它是一上来就动手，还是先列个计划？
+
+s05 待办（TodoWrite）→ 给 Agent 一个计划工具。先列清单，再做。

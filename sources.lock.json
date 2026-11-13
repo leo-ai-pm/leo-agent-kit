@@ -1,0 +1,5 @@
+[
+  {"repo":"hubooooooo/claude-code-harness-study","commit":"b6e930a3fa672b22037b3dce06f08f4c7e26cc55","required":["LICENSE","index.html","run.py","guide/README.md"]},
+  {"repo":"hubooooooo/agent-workshop","commit":"96fd80f9d63ec2037aa85f3d2f43ea5286b34a2c","required":["LICENSE","blueprint/__main__.py","requirements.txt"]},
+  {"repo":"hubooooooo/idea-to-launch-kit","commit":"3e9bf7a0897fa84e3cdb85f9ec47828661c3d198","required":["LICENSE","kit.sh","verify.sh","AGENTS.md"]}
+]

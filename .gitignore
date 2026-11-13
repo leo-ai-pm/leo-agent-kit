@@ -1,0 +1,11 @@
+workspace/
+.venv/
+**/__pycache__/
+**/.env
+**/.env.local
+**/.env.prod
+**/.env.deploy
+**/.venv/
+**/node_modules/
+**/out/
+.DS_Store

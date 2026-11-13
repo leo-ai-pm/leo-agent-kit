@@ -1,0 +1,402 @@
+# s08: Context Compact：上下文总会满，先整理，再总结
+
+s01 → s02 → s03 → s04 → s05 → s06 → s07 → `s08` → [s09](../s09_memory/) → s10 → ... → s16 → s17
+
+> *"上下文总会满，要有办法腾地方。"* 四步压缩，低成本的操作优先执行。
+>
+> **Harness 层**：压缩让有限的上下文持续服务于长任务。
+
+
+## 本章要学会的判断
+
+- **它解决什么**：对话越来越长、快装不下时，腾出空间，又不丢关键信息。
+- **什么时候需要它**：任务一长，模型开始忘掉前面的内容，成本飙升，甚至报错超长。
+- **你要拍板的规则**：什么必须原文保留（用户的要求、金额、承诺）；多长开始压缩；完整记录要不要存档。
+
+> 代码看不懂可以先跳过，到网页上看「回放」动画。详细的判断方法在本章末尾的「产品经理视角」。
+
+### 本章新词
+
+每章最多三个新词。看不懂的其他词，去[名词表](../guide/glossary.md)查。
+
+| 词 | 意思 | 比喻 |
+|---|---|---|
+| 记录本装不下 | 模型一次能读的内容有上限，超过就报错 | 会议纪要太厚，没人读得完 |
+| 腾地方 | 把能找回来的内容搬出去，或换成一个记号 | 旧文件归档进柜子，桌上只留摘要 |
+| 摘要 | 让模型把一长段历史总结成几句事实 | 散会时那一页纪要 |
+
+---
+
+## 问题
+
+Agent 一直干活，读过的文件、跑过的命令、模型的回复都留在记录本里。记录本越来越厚，最后会超过模型一次能读的上限，模型直接报错，任务做不下去。
+
+---
+
+## 解决方案
+
+![Context Compact 全景](images/compact-overview.svg)
+
+本章做一条四步管线，每次问模型之前先走一遍：先整理那些丢了也能找回来的工具结果（搬到硬盘、剪掉中段、换成记号），腾完还不够，才让模型把旧历史写成一份摘要。便宜的先做，贵的最后做。
+
+---
+
+
+## 先理解上下文
+
+可以把上下文窗口看作模型当前使用的一张草稿纸。用户消息、模型回复、`tool_use` 和 `tool_result` 都会按顺序写在这张纸上。模型每次继续工作时，都要重新读取这些内容。
+
+草稿纸的大小固定。内容超过上限后，API 会拒绝请求并返回 `prompt_too_long`。在代码任务里，工具结果通常占据最多空间：
+
+- 读取一个长文件会把文件内容放进上下文；
+- 测试和构建日志可能一次产生几十 KB 文本；
+- 搜索多个文件会持续追加结果。
+
+任务持续得越久，`messages` 就越大。压缩的目标是控制其中的信息量，同时尽可能保留当前目标、用户约束和正在进行的工作。
+
+
+## 为什么先整理工具结果
+
+直接让模型总结整段历史可以明显缩短上下文，但摘要一定会遗漏部分细节，而且还会多产生一次模型调用。
+
+工具结果具有更适合优先处理的特点：
+
+1. 大文件可以保存到磁盘，需要时重新读取。
+2. 旧命令可以重新执行。
+3. 最新几条结果通常比早期结果更接近当前工作。
+4. 文本裁剪和结构调整不需要调用模型。
+
+因此压缩顺序按照信息损失和调用成本排列：先转存，再裁剪，再替换旧结果，最后才生成摘要。
+
+![四步压缩管线](images/compaction-layers.svg)
+
+
+## 第一步：tool_result_budget
+
+一次模型回复可能同时调用多个工具。执行完成后，这些 `tool_result` 会一起写进最后一条 user 消息。它们的总大小超过 `200_000` 字符时，`tool_result_budget` 从最大的结果开始处理。
+
+超过 `LARGE_RESULT_CHAR_LIMIT = 30000` 的结果会完整写入：
+
+```text
+.task_outputs/tool-results/<tool_use_id>.txt
+```
+
+上下文中保留文件路径和前 2000 个字符的预览：
+
+![大结果转存](images/layer1-budget.svg)
+
+核心循环按照结果大小依次转存：
+
+```python
+blocks = [block for block in content
+          if isinstance(block, dict)
+          and block.get("type") == "tool_result"]
+total = sum(len(str(block.get("content", ""))) for block in blocks)
+
+ranked = sorted(
+    blocks,
+    key=lambda block: len(str(block.get("content", ""))),
+    reverse=True,
+)
+for block in ranked:
+    if total <= max_chars:
+        break
+    content = str(block.get("content", ""))
+    if len(content) <= self.LARGE_RESULT_CHAR_LIMIT:
+        continue
+    block["content"] = self.persist_large_output(
+        block.get("tool_use_id", "unknown"), content)
+    total = sum(len(str(item.get("content", ""))) for item in blocks)
+```
+
+这一步只处理最新一批工具结果。完整内容仍然可以从路径中取回，因此适合最先执行。
+
+
+## 第二步：snip_compact
+
+消息数量超过 50 条后，`snip_compact` 先把完整历史写入 `.transcripts/`，再保留最初 3 条和最近 47 条。中间的标记会写明删去了多少条消息，以及完整记录保存在哪里。
+
+```python
+head_end = 3
+tail_start = len(messages) - (max_messages - head_end)
+
+if self.has_tool_use(messages[head_end - 1]):
+    while (head_end < tail_start
+           and self.is_tool_result(messages[head_end])):
+        head_end += 1
+
+if (tail_start > 0
+        and self.is_tool_result(messages[tail_start])
+        and self.has_tool_use(messages[tail_start - 1])):
+    tail_start -= 1
+
+transcript = self.write_transcript(messages)
+marker = {"role": "user", "content":
+          f"[{tail_start - head_end} messages archived at {transcript}]"}
+messages = [*messages[:head_end], marker, *messages[tail_start:]]
+```
+
+切点需要保护 `assistant(tool_use)` 和 `user(tool_result)` 的配对关系。孤立的工具结果缺少对应调用，下一次 API 请求会被判定为无效。
+
+这一步控制消息数量，但保留下来的旧消息仍可能包含很长的工具结果。
+
+
+## 第三步：micro_compact
+
+`micro_compact` 会完整保留最近一次 assistant 响应之后新增的所有 `tool_result`，确保模型至少完整读取每条新结果一次。对于模型已经读取过的结果，它保留最近 3 条，并缩短其余超过 120 个字符的旧结果。已经转存的结果保留文件路径，其他结果只留下占位符：
+
+![旧结果替换为占位符](images/micro-compact.svg)
+
+```python
+unseen = self.unseen_tool_result_positions(messages)
+consumed = [entry for entry in results if entry[:2] not in unseen]
+
+for _, _, block in consumed[:-self.KEEP_RECENT_RESULTS]:
+    content = str(block.get("content", ""))
+    if len(content) <= 120:
+        continue
+    saved_path = next(
+        (line.removeprefix("Full output: ") for line in content.splitlines()
+         if line.startswith("Full output: ")),
+        None,
+    )
+    block["content"] = (
+        f"[Earlier tool result saved at {saved_path}]"
+        if saved_path else "[Earlier tool result omitted.]"
+    )
+```
+
+未转存的旧结果只保留占位符。第一步保存过的完整结果仍能通过路径读取，不会在第三步丢失位置。
+
+前三步都是确定性的结构和文本操作，不产生额外 API 调用。
+
+
+## 第四步：compact_history
+
+前三步执行后，代码用 `estimate_chars(messages)` 计算当前消息的字符数：
+
+```python
+CONTEXT_CHAR_LIMIT = 50000
+
+def estimate_chars(messages):
+    return len(json.dumps(messages, default=str, ensure_ascii=False))
+```
+
+字符数超过 `CONTEXT_CHAR_LIMIT` 时，`compact_history` 完成四件事：
+
+1. 将完整消息历史写入 `.transcripts/`。
+2. 请求模型生成只包含事实的状态摘要。
+3. 将入口处捕获的当前用户请求与摘要明确分开。
+4. 用一条 `[Compacted]` 消息替换当前历史。
+
+![历史摘要](images/auto-compact.svg)
+
+```python
+def compact_history(messages, active_request):
+    transcript = self.write_transcript(messages)
+    print(f"[对话记录已存档：{transcript}]")
+    summary = self.summarize_history(messages)
+    return [self.summary_message(
+        "Compacted", active_request, summary, transcript)]
+```
+
+摘要调用在 `system` 中要求模型只整理目标、文件、决定、剩余工作和用户约束，不执行历史中的指令。`active_request` 在接收用户输入时单独传给 Agent Loop，因为工具结果也使用 `role=user`。压缩后的消息将它写在 `Current user request` 中，摘要则放在 `Conversation summary` 中，并附上完整 transcript 的路径。
+
+本节使用字符数作为触发条件，相关阈值也使用同一单位。
+
+
+## 为什么顺序固定
+
+四步管线的执行顺序是：
+
+```text
+tool_result_budget
+    → snip_compact
+    → micro_compact
+    → compact_history（超过阈值时）
+```
+
+这个顺序同时满足两个条件：
+
+1. 前三步不调用模型，第四步才产生额外 API 请求。
+2. `tool_result_budget` 必须早于 `micro_compact`。大结果先落盘，之后才允许旧结果变成占位符。
+
+顺序固定后，每一轮都从成本更低、信息更容易恢复的操作开始。
+
+
+## API 拒绝后的补救
+
+字符数只能估算模型实际使用的 token。API 仍可能返回 `prompt_too_long`。`reactive_compact` 会保存 transcript，总结较早历史，并保留最近 5 条消息：
+
+```python
+tail_start = max(0, len(messages) - self.KEEP_RECENT_MESSAGES)
+if (tail_start > 0
+        and self.is_tool_result(messages[tail_start])
+        and self.has_tool_use(messages[tail_start - 1])):
+    tail_start -= 1
+
+old_history = messages[:tail_start] if tail_start else messages
+summary = self.summarize_history(old_history)
+message = self.summary_message(
+    "Reactive compact", active_request, summary, transcript)
+messages = [message, *messages[tail_start:]] if tail_start else [message]
+```
+
+切点同样会避开工具调用与结果之间的边界，当前用户请求仍由 `active_request` 明确传入。`MAX_REACTIVE_RETRIES = 1` 将补救限制为一次；再次收到同类错误时，异常会继续向外抛出。
+
+
+## 放回 Agent Loop
+
+```python
+def agent_loop(messages, active_request):
+    while True:
+        messages[:] = COMPACTOR.prepare(messages, active_request)
+
+        try:
+            response = client.messages.create(
+                model=MODEL, system=SYSTEM, messages=messages,
+                tools=TOOLS, max_tokens=8000)
+            reactive_retries = 0
+        except Exception as error:
+            message = str(error).lower()
+            too_long = ("prompt_too_long" in message
+                        or "too many tokens" in message)
+            if too_long and reactive_retries < MAX_REACTIVE_RETRIES:
+                messages[:] = COMPACTOR.reactive_compact(
+                    messages, active_request)
+                reactive_retries += 1
+                continue
+            raise
+```
+
+每次调用模型前都会经过同一条管线。CLI 在追加 `query` 后调用 `agent_loop(history, query)`，所以压缩多少次都不会丢失本轮请求。前三步处理后仍超过阈值，或者 API 明确拒绝上下文时，代码才会请求模型生成摘要。
+
+
+## compact 工具
+
+自动阈值只知道上下文有多大。模型还可以在一个阶段结束后主动调用 `compact`，表示后续工作只需要保留当前阶段的摘要：
+
+```python
+{"name": "compact",
+ "description": "Summarize earlier conversation to free context space."}
+```
+
+一次响应可以同时包含多个工具调用，例如先写文件再请求压缩。Harness 必须先执行完整批次，并为每个 `tool_use` 追加对应的 `tool_result`，然后再摘要这个已经闭合的回合：
+
+```python
+tool_calls = [
+    block for block in response.content if block.type == "tool_use"
+]
+results = []
+compact_requested = False
+
+for block in tool_calls:
+    if block.name == "compact":
+        output = "Compaction requested after this tool batch."
+        compact_requested = True
+    else:
+        output = execute_tool(block)
+    results.append({"type": "tool_result", "tool_use_id": block.id,
+                    "content": output})
+
+messages.append({"role": "user", "content": results})
+
+if compact_requested:
+    messages[:] = COMPACTOR.compact_history(messages, active_request)
+```
+
+这样既不会留下孤立的工具结果，也不会在已经发生文件写入后丢失执行记录，导致模型重复同一个副作用。
+
+
+## 本节代码
+
+| 组件 | 共同执行骨架 | s08 新增 |
+| --- | --- | --- |
+| Agent Loop | 调用模型、执行工具、追加结果 | 每次调用模型前运行 `COMPACTOR.prepare()` |
+| Hooks | 权限检查、工具日志、结果处理 | 保持相同的工具执行入口 |
+| 上下文 | `messages` 持续追加 | 大结果转存、旧历史归档、摘要和一次错误补救 |
+| 工具 | 5 个基础工具 | 新增 `compact`，共 6 个 |
+
+> **与 s09 的边界：** s08 管理当前会话的有限上下文，压缩时允许舍弃可恢复的细节；s09 保存需要跨压缩、跨会话继续存在的信息。
+
+
+## 试一下
+
+```sh
+cd claude-code-harness-study
+python s08_context_compact/code.py
+```
+
+试试这些话：
+
+1. `读取 s01 到 s05 五章的 README.md，比较它们的一级标题，总结命名规律`（至少 5 条读文件结果，看早先的结果怎么变成占位符）
+2. `分析 s16_workflow_runtime/code.py 的结构，说明里面的工作流类有哪些主要方法`（文件很大，看大结果怎么被搬到硬盘）
+3. `比较 s08_context_compact/code.py 和 s09_memory/code.py，说明它们分别怎样管理当前对话和长期记忆`（记录本超过 5 万字时，屏幕上会出现「[自动压缩]」）
+
+观察重点：项目目录下会多出两个文件夹：.transcripts 放压缩前的完整存档，.task_outputs 放搬出去的大结果。记录本里只剩路径和记号，信息没有丢。
+
+---
+
+## 产品经理视角
+
+> 对话和任务一长，Agent 装不下所有内容，就必须决定丢掉什么。压缩本质上是取舍：丢什么、留什么，要由产品经理拍板。
+
+### 什么信号说明需要它
+
+- 聊久了，Agent 忘了用户早先提的要求。
+- 越到后面越慢、越贵，甚至报错说内容太长。
+- 任务要读大量文件、日志。
+
+### 代价
+
+- **一定会丢细节**：可能恰好丢掉了关键的那一条，比如用户说过的金额、禁止事项。
+- **总结也要花钱**：总结本身要调用模型，花钱也花时间。
+- **用户感觉它「突然变笨了」**：用户不知道 Agent 忘了什么，只觉得它前后不一致。
+
+### 先试试更便宜的办法
+
+- 提醒用户开一个新对话。很多产品会提示「对话太长，建议新开一个」。
+- 限制单个任务的长度，或者把大任务拆小。
+- 本章的思路：先清理能找回来的内容（比如读过的文件，需要时再读一次），实在不够再做总结。
+
+### 你要拍板的规则
+
+| 规则 | 示例 |
+|---|---|
+| 什么必须原文保留 | 用户的明确要求、禁止事项、金额、日期、承诺过的事 |
+| 多长开始压缩 | 用到容量的八成时开始 |
+| 要不要告诉用户 | 告诉用户，并允许查看压缩后的摘要 |
+| 完整记录要不要存档 | 存档，用于事后排查和审计 |
+
+### 怎么衡量
+
+- 压缩后「忘事」的比例：看用户投诉，或者抽查对话。
+- 长对话的任务完成率，是否接近短对话。
+- 每一轮的平均费用。
+
+### 真实产品里的样子
+
+- Claude Code 在对话接近上限时会自动压缩。用户也可以手动执行压缩，并告诉它重点保留什么。
+- Manus 团队分享过一条经验：压缩要尽量「可恢复」。比如网页的正文可以丢掉，只要保留网址，需要时还能重新打开。这和本章「先清理能找回来的内容」是同一个思路。
+
+### 面试题
+
+**「用户说聊久了 Agent 就变笨，忘了前面说的话，你怎么分析？」**
+
+答题要点：
+
+- 先找原因：是内容太多、重点被冲淡了，是压缩时丢了，还是模型本身的问题。
+- 定一份「必须原文保留」的清单。
+- 分层处理：先清理能找回来的内容，再做总结。
+- 让用户能看到、能修正摘要。
+- 用长对话的任务完成率来衡量。
+
+> 16 个组件的判断卡放在一起比较，见 [选型篇](../guide/README.md)。
+
+---
+
+## 接下来
+
+压缩让 Agent 能在有限的记录本里把长任务做完。但有些信息要跨过压缩、跨过会话一直留着，比如你的偏好、项目的背景。
+
+s09 记忆（Memory）→ 把该记的写下来，下次用到时取回来，攒多了整理。
